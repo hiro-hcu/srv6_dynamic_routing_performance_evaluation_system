@@ -7,6 +7,10 @@ echo "Starting r16 router with SSH support..."
 echo "Setting up SRv6..."
 /usr/local/bin/srv6_setup.sh
 
+# 帯域制限を適用
+echo "Setting up bandwidth limits..."
+/usr/local/bin/set_bandwidth_limit.sh
+
 
 # MACアドレスを設定（external-server側インターフェース）
 # SRv6セットアップ後にIPアドレスが設定されてから実行

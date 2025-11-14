@@ -92,7 +92,7 @@ services:
   r6:
     build: 
       context: ./router
-      dockerfile: Dockerfile_r6
+      dockerfile: Dockerfile
     container_name: r6
     hostname: r6
     privileged: true
