@@ -9,8 +9,8 @@ echo "Configuring bandwidth limit for: $HOSTNAME"
 # 1Gbps = 1000Mbit
 BANDWIDTH="1000mbit"
 
-# loとcontroller-rを除く全インターフェースに帯域制限を設定
-for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | tr -d ' ' | grep -vE '^(lo|eth0)$'); do
+# lo以外の全インターフェースに帯域制限を設定
+for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | tr -d ' ' | grep -v '^lo$'); do
     echo "Setting $BANDWIDTH limit on $iface"
     
     # 既存のqdisc設定を削除（エラーを無視）
@@ -27,12 +27,12 @@ done
 
 echo ""
 echo "=== Bandwidth limit configuration complete ==="
-echo "All interfaces (except lo and eth0) are limited to $BANDWIDTH"
+echo "All interfaces (except lo) are limited to $BANDWIDTH"
 
 # 設定の確認
 echo ""
 echo "=== Current tc qdisc settings ==="
-for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | tr -d ' ' | grep -vE '^(lo|eth0)$'); do
+for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | tr -d ' ' | grep -v '^lo$'); do
     echo "Interface: $iface"
     tc qdisc show dev $iface 2>/dev/null || echo "  No qdisc configured"
 done
