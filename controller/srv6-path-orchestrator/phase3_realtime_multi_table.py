@@ -6,6 +6,8 @@ phase3_multi_table_simple.py + main.py の統合拡張版
 """
 
 import networkx as nx
+import matplotlib
+matplotlib.use('Agg')  # ファイル保存用バックエンド（GUIなし環境対応）
 import matplotlib.pyplot as plt
 import subprocess
 import sys
@@ -13,9 +15,12 @@ import math
 import time
 import paramiko
 import logging
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+import threading
+import os
 
 # ログ設定
 logging.basicConfig(
@@ -23,6 +28,10 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# matplotlib の日本語フォント警告を抑制
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+warnings.filterwarnings('ignore', message='.*Glyph.*missing from.*font.*')
 
 @dataclass
 class SRv6Config:
@@ -174,43 +183,66 @@ class RRDDataManager:
             return None
     
     def update_edge_weights(self, graph: nx.Graph) -> bool:
-        """エッジ重みをRRDデータで更新"""
+        """エッジ重みをRRDデータで更新（利用率: 0-1の範囲、重みとして設定）"""
         logger.info("RRDデータからエッジ重みを更新中...")
         update_count = 0
+        no_rrd_count = 0
+        no_data_count = 0
+        
+        # 最小重み値（利用率が0でも経路選択の多様性を保つため）
+        min_weight = 0.0001
         
         for u, v in graph.edges():
             edge_key = (u, v) if (u, v) in self.config.rrd_paths else (v, u)
             rrd_path = self.config.rrd_paths.get(edge_key)
+            max_bandwidth = graph[u][v].get('max_bandwidth', 125_000_000)  # デフォルト1Gbps
             
             if rrd_path:
-                out_bps = self.fetch_rrd_data(rrd_path)
-                if out_bps is not None:
-                    weight_value = out_bps if out_bps > 0 else 0.001
-                    graph[u][v]['weight'] = weight_value
+                out_bytes_per_sec = self.fetch_rrd_data(rrd_path)
+                if out_bytes_per_sec is not None:
+                    # 利用率計算: u = データ転送量 / 帯域の最大値 (0-1の範囲)
+                    utilization = out_bytes_per_sec / max_bandwidth
+                    utilization = max(0.0, min(1.0, utilization))  # 0-1にクリップ
+                    # 最小重み値を保証（0の場合でも0.0001以上）
+                    graph[u][v]['weight'] = max(utilization, min_weight)
                     
                     # 表示用単位変換
-                    display_val = round(out_bps * 8 / 1_000_000, 2) if out_bps >= 1000 else round(out_bps, 3)
-                    unit = "Mbps" if out_bps >= 1000 else "bps"
+                    display_val = round(out_bytes_per_sec * 8 / 1_000_000, 2) if out_bytes_per_sec >= 1000 else round(out_bytes_per_sec, 3)
+                    unit = "Mbps" if out_bytes_per_sec >= 1000 else "bps"
                     
-                    logger.info(f"Edge r{u} <-> r{v}: {display_val} {unit}")
+                    logger.info(f"Edge r{u} <-> r{v}: {display_val} {unit} (利用率: {utilization:.4f})")
                     update_count += 1
                 else:
-                    graph[u][v]['weight'] = 0.001
+                    graph[u][v]['weight'] = min_weight  # データなしの場合は最小値
+                    logger.warning(f"Edge r{u} <-> r{v}: RRDデータ取得失敗 (重み={min_weight})")
+                    no_data_count += 1
             else:
-                graph[u][v]['weight'] = 0.001
+                graph[u][v]['weight'] = min_weight  # RRDパスなしの場合は最小値
+                logger.warning(f"Edge r{u} <-> r{v}: RRDファイル未定義 (重み={min_weight})")
+                no_rrd_count += 1
         
-        logger.info(f"エッジ重み更新完了: {update_count}/{len(graph.edges())}")
+        logger.info(f"エッジ重み更新完了: {update_count}/{len(graph.edges())} (RRD未定義: {no_rrd_count}, データ取得失敗: {no_data_count})")
         return update_count > 0
 
 class SRv6PathManager:
     """SRv6双方向パス管理クラス（簡素化版）"""
     
-    def __init__(self):
+    def __init__(self, enable_visualization: bool = False):
         self.config = SRv6Config()
         self.rrd_manager = RRDDataManager(self.config)
         self.ssh_manager = SSHConnectionManager(self.config)
         self.path_calculator = PathCalculator(self.config)
         self.table_manager = RoutingTableManager(self.config, self.ssh_manager, self.path_calculator)
+        
+        # 可視化機能
+        self.enable_visualization = enable_visualization
+        self.visualizer = None
+        self.update_count = 0
+        self.calculated_paths = None  # 計算された3つの経路を保存
+        
+        if self.enable_visualization:
+            self.visualizer = TopologyVisualizer(self.path_calculator.graph)
+            logger.info("トポロジ可視化機能を有効化しました")
     
     def get_all_traffic_data(self):
         """RRDトラフィックデータ取得（エッジ重み更新）"""
@@ -224,12 +256,38 @@ class SRv6PathManager:
         if traffic_data and traffic_data.get("status") == "success":
             paths = self.path_calculator.calculate_multiple_paths(1, 16, 3)
             if paths:
+                self.calculated_paths = paths  # 3つの経路を保存
                 return paths[0][0]  # 最適経路のノードリストを返す
         return None
     
     def create_table_routes(self, optimal_path):
-        """往路テーブルルート生成"""
-        return self.table_manager.create_table_routes(optimal_path, is_return=False)
+        """往路テーブルルート生成（既に計算済みの経路を使用）"""
+        # self.calculated_paths に保存された経路情報を使用
+        if not self.calculated_paths:
+            logger.error("経路情報が存在しません")
+            return None
+        
+        table_routes = []
+        for i, (calculated_path, cost) in enumerate(self.calculated_paths):
+            if i >= len(self.config.tables):
+                break
+            
+            sid_list, interface_list, output_interface = self.path_calculator.path_to_sid_list(calculated_path, is_return=False)
+            path_str = " → ".join([f"r{n}" for n in calculated_path])
+            
+            table_route = TableRoute(
+                table_name=self.config.tables[i]["name"],
+                priority=self.config.tables[i]["priority"],
+                path=calculated_path,
+                segments=sid_list,
+                interfaces=interface_list,
+                output_interface=output_interface,
+                cost=cost,
+                description=f"{path_str} (コスト: {cost:.6f})"
+            )
+            table_routes.append(table_route)
+        
+        return table_routes
     
     def update_all_tables(self, table_routes):
         """往路テーブル更新"""
@@ -242,6 +300,11 @@ class SRv6PathManager:
     def update_return_tables(self, return_table_routes):
         """復路テーブル更新"""
         return self.table_manager.update_all_tables(return_table_routes, is_return=True)
+    
+    def visualize_network(self):
+        """ネットワークトポロジと経路を可視化"""
+        if self.enable_visualization and self.visualizer:
+            self.visualizer.visualize(paths=self.calculated_paths, update_count=self.update_count)
     
     def update_bidirectional_tables(self) -> bool:
         """双方向テーブル統合更新メソッド"""
@@ -286,6 +349,10 @@ class SRv6PathManager:
             # 復路テーブル更新実行（r6）
             return_success = self.update_return_tables(return_table_routes)
             
+            # 可視化の更新
+            self.update_count += 1
+            self.visualize_network()
+            
             # 結果判定
             if forward_success and return_success:
                 logger.info("✅ 双方向テーブル更新成功")
@@ -300,6 +367,11 @@ class SRv6PathManager:
             logger.error(f"双方向テーブル更新例外: {e}")
             return False
     
+    def cleanup(self):
+        """リソースのクリーンアップ"""
+        if self.visualizer:
+            self.visualizer.close()
+    
 class PathCalculator:
     """経路計算とSIDリスト生成クラス"""
     
@@ -309,55 +381,91 @@ class PathCalculator:
         self._create_topology()
     
     def _create_topology(self):
-        """ネットワークトポロジ作成"""
+        """ネットワークトポロジ作成（最大帯域幅: 1Gbps = 125,000,000 Bytes/s）"""
         self.graph.add_nodes_from(range(1, 17))  # r1-r16
+        # 全リンクの最大帯域幅: 1Gbps = 1,000,000,000 bps = 125,000,000 Bytes/s
+        max_bandwidth = 125_000_000  # Bytes/s (tcコマンドで1Gbpsに制限)
         edges = [
-            (1, 2, {'weight': 0.001}), (1, 3, {'weight': 0.001}),
-            (2, 4, {'weight': 0.001}), (2, 5, {'weight': 0.001}),
-            (3, 5, {'weight': 0.001}), (3, 6, {'weight': 0.001}),
-            (4, 7, {'weight': 0.001}), (4, 8, {'weight': 0.001}),
-            (5, 8, {'weight': 0.001}), (5, 9, {'weight': 0.001}),
-            (6, 9, {'weight': 0.001}), (6, 10, {'weight': 0.001}),
-            (7, 11, {'weight': 0.001}), (8, 11, {'weight': 0.001}),
-            (8, 12, {'weight': 0.001}), (9, 12, {'weight': 0.001}),
-            (9, 13, {'weight': 0.001}), (10, 13, {'weight': 0.001}),
-            (11, 14, {'weight': 0.001}), (12, 14, {'weight': 0.001}),
-            (12, 15, {'weight': 0.001}), (13, 15, {'weight': 0.001}),
-            (14, 16, {'weight': 0.001}), (15, 16, {'weight': 0.001}),
+            (1, 2, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (1, 3, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (2, 4, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (2, 5, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (3, 5, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (3, 6, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (4, 7, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (4, 8, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (5, 8, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (5, 9, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (6, 9, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (6, 10, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (7, 11, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (8, 11, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (8, 12, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (9, 12, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (9, 13, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (10, 13, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (11, 14, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (12, 14, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (12, 15, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (13, 15, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (14, 16, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
+            (15, 16, {'weight': 0.0001, 'max_bandwidth': max_bandwidth}),
         ]
         self.graph.add_edges_from(edges)
     
-    def calculate_multiple_paths(self, src: int, dst: int, num_paths: int = 3) -> List[Tuple[List[int], float]]:
-        """複数経路計算"""
+    def calculate_multiple_paths(self, src: int, dst: int, num_paths: int = 3, verbose: bool = True) -> List[Tuple[List[int], float]]:
+        """複数経路計算（利用率ベースのDijkstra法 + 重み倍率適用）
+        
+        利用率: データ転送量 / 帯域の最大値（0-1の範囲）
+        重み: 利用率を初期値とし、経路選択後に倍率適用（上限なし）
+        
+        1つ目の経路（高優先度）: 使用エッジの重みを3倍
+        2つ目の経路（中優先度）: 使用エッジの重みを2倍
+        3つ目の経路（低優先度）: そのまま
+        
+        Args:
+            src: 送信元ノード
+            dst: 宛先ノード
+            num_paths: 計算する経路数
+            verbose: 詳細ログを出力するか（Falseで復路の出力を抑制）
+        """
         paths = []
         temp_graph = self.graph.copy()
         
+        # 重み倍率の定義（優先度ごと）
+        weight_multipliers = [3.0, 2.0, 1.0]  # 高優先度、中優先度、低優先度
+        
         for i in range(num_paths):
             try:
+                # Dijkstra法で最短経路計算（重みは利用率ベース）
                 path = nx.shortest_path(temp_graph, src, dst, weight='weight')
                 cost = nx.shortest_path_length(temp_graph, src, dst, weight='weight')
                 paths.append((path, cost))
                 
-                # 次の経路のためにエッジを削除または重み増加
-                if i < num_paths - 1 and len(path) > 2:
-                    # 全エッジをループ: 始点・終点エッジは重み1000倍、中間エッジは削除
+                if verbose:
+                    logger.info(f"経路{i+1}（優先度: {['高', '中', '低'][i] if i < 3 else '---'}）: "
+                               f"{' → '.join([f'r{n}' for n in path])} (総コスト: {cost:.6f})")
+                    
+                    # 各エッジのコスト詳細を出力
                     for j in range(len(path) - 1):
                         u, v = path[j], path[j + 1]
                         if temp_graph.has_edge(u, v):
-                            # 始点エッジ (j=0) または 終点エッジ (j=len(path)-2): 重みを1000倍
-                            if j == 0 or j == len(path) - 2:
-                                temp_graph[u][v]['weight'] *= 1000
-                            # 中間エッジ: 削除
-                            else:
-                                temp_graph.remove_edge(u, v)
-                elif i < num_paths - 1:
-                    # 経路が短い場合は全エッジの重みを1000倍
+                            edge_cost = temp_graph[u][v]['weight']
+                            logger.info(f"  Edge r{u}-r{v}: コスト={edge_cost:.6f}")
+                
+                # 次の経路のために使用したエッジの重みを増加
+                if i < num_paths - 1 and i < len(weight_multipliers):
+                    multiplier = weight_multipliers[i]
                     for j in range(len(path) - 1):
                         u, v = path[j], path[j + 1]
                         if temp_graph.has_edge(u, v):
-                            temp_graph[u][v]['weight'] *= 1000
+                            old_weight = temp_graph[u][v]['weight']
+                            new_weight = old_weight * multiplier  # 上限なし
+                            temp_graph[u][v]['weight'] = new_weight
+                            logger.debug(f"  Edge r{u}-r{v}: {old_weight:.4f} → {new_weight:.4f} ({multiplier}倍)")
                             
             except nx.NetworkXNoPath:
+                logger.warning(f"経路{i+1}の計算失敗: 経路が存在しません")
                 break
             except Exception as e:
                 logger.error(f"経路計算エラー: {e}")
@@ -379,7 +487,140 @@ class PathCalculator:
         
         output_interface = interface_list[0] if interface_list else "eth0"
         return sid_list, interface_list, output_interface
+
+class TopologyVisualizer:
+    """ネットワークトポロジ可視化クラス"""
     
+    def __init__(self, graph: nx.Graph, output_dir: str = "/opt/app/visualization"):
+        self.graph = graph
+        self.output_dir = output_dir
+        self.fig = None
+        self.ax = None
+        self.pos = None
+        
+        # 出力ディレクトリの作成
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info(f"可視化出力ディレクトリ: {self.output_dir}")
+        
+        self._setup_figure()
+    
+    def _setup_figure(self):
+        """図の初期設定（格子状レイアウト）"""
+        self.fig, self.ax = plt.subplots(figsize=(14, 10))
+        
+        # 格子状の位置を手動で設定（4行4列）
+        # r1, r2, r4, r7 (上段)
+        # r3, r5, r8, r11 (2段目)
+        # r6, r9, r12, r14 (3段目)
+        # r10, r13, r15, r16 (下段)
+        self.pos = {
+            1: (0, 3), 2: (1, 3), 4: (2, 3), 7: (3, 3),
+            3: (0, 2), 5: (1, 2), 8: (2, 2), 11: (3, 2),
+            6: (0, 1), 9: (1, 1), 12: (2, 1), 14: (3, 1),
+            10: (0, 0), 13: (1, 0), 15: (2, 0), 16: (3, 0)
+        }
+    
+    def visualize(self, paths: List[Tuple[List[int], float]] = None, update_count: int = 0):
+        """トポロジ、エッジの重み、選択された経路を可視化
+        
+        Args:
+            paths: [(経路ノードリスト, コスト), ...] の形式のリスト（最大3つ）
+            update_count: 更新回数
+        """
+        self.ax.clear()
+        
+        # ノードの描画
+        nx.draw_networkx_nodes(
+            self.graph, self.pos, 
+            node_color='lightblue', 
+            node_size=800, 
+            ax=self.ax
+        )
+        
+        # ノードラベルの描画
+        nx.draw_networkx_labels(
+            self.graph, self.pos, 
+            labels={node: f'r{node}' for node in self.graph.nodes()},
+            font_size=10,
+            font_weight='bold',
+            ax=self.ax
+        )
+        
+        # 全エッジの描画（グレー、細線）
+        nx.draw_networkx_edges(
+            self.graph, self.pos,
+            edge_color='gray',
+            width=1,
+            alpha=0.3,
+            ax=self.ax
+        )
+        
+        # エッジの重み（利用率とコスト）をラベルとして表示
+        edge_labels = {}
+        for u, v in self.graph.edges():
+            weight = self.graph[u][v].get('weight', 0.0)
+            # 利用率とコストを表示
+            edge_labels[(u, v)] = f'U:{weight:.4f}\nC:{weight:.4f}'
+        
+        nx.draw_networkx_edge_labels(
+            self.graph, self.pos,
+            edge_labels=edge_labels,
+            font_size=8,
+            ax=self.ax
+        )
+        
+        # 選択された経路を色分けして描画
+        if paths:
+            colors = ['red', 'orange', 'green']  # 高優先度、中優先度、低優先度
+            labels = ['高優先度', '中優先度', '低優先度']
+            widths = [4, 3, 2]
+            
+            for idx, (path_nodes, cost) in enumerate(paths[:3]):
+                if idx >= len(colors):
+                    break
+                
+                # 経路のエッジリストを作成
+                path_edges = [(path_nodes[i], path_nodes[i+1]) for i in range(len(path_nodes)-1)]
+                
+                # 経路のエッジリストとコストを計算
+                edge_costs = []
+                for i in range(len(path_nodes) - 1):
+                    u, v = path_nodes[i], path_nodes[i+1]
+                    edge_cost = self.graph[u][v].get('weight', 0.0)
+                    edge_costs.append(edge_cost)
+                
+                # 経路を太い色付き線で描画
+                path_str = " → ".join([f"r{n}" for n in path_nodes])
+                avg_edge_cost = sum(edge_costs) / len(edge_costs) if edge_costs else 0.0
+                nx.draw_networkx_edges(
+                    self.graph, self.pos,
+                    edgelist=path_edges,
+                    edge_color=colors[idx],
+                    width=widths[idx],
+                    alpha=0.7,
+                    label=f'{labels[idx]}: {path_str}\n総コスト={cost:.4f}, 平均エッジコスト={avg_edge_cost:.4f}',
+                    ax=self.ax
+                )
+        
+        # タイトルと凡例
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        self.ax.set_title(f'SRv6 ネットワークトポロジと経路選択\n(更新回数: {update_count}, 更新時刻: {timestamp})', 
+                         fontsize=14, fontweight='bold')
+        if paths:
+            self.ax.legend(loc='upper left', fontsize=9)
+        
+        self.ax.axis('off')
+        plt.tight_layout()
+        
+        # 画像ファイルとして保存（最新版のみ）
+        latest_path = os.path.join(self.output_dir, 'topology_latest.png')
+        plt.savefig(latest_path, dpi=150, bbox_inches='tight')
+    
+    def close(self):
+        """図を閉じる"""
+        if self.fig:
+            plt.close(self.fig)
+
 class SSHConnectionManager:
     """SSH接続管理クラス"""
     
@@ -469,7 +710,7 @@ class RoutingTableManager:
     
     def create_table_routes(self, path: List[int], is_return: bool = False) -> List[TableRoute]:
         """テーブル経路情報作成"""
-        paths = self.path_calculator.calculate_multiple_paths(path[0], path[-1], 3)
+        paths = self.path_calculator.calculate_multiple_paths(path[0], path[-1], 3, verbose=(not is_return))
         table_routes = []
         
         for i, (calculated_path, cost) in enumerate(paths):
@@ -812,6 +1053,7 @@ def main():
     parser.add_argument("--dst", type=int, default=16, help="宛先ノード")
     parser.add_argument("--interval", type=int, default=60, help="更新間隔（秒）- RRD更新間隔に合わせて60秒推奨")
     parser.add_argument("--once", action="store_true", help="1回のみ実行")
+    parser.add_argument("--visualize", action="store_true", help="トポロジ可視化を有効化")
     
     args = parser.parse_args()
     
@@ -820,7 +1062,7 @@ def main():
     try:
         if args.mode == "bidirectional":
             # 双方向管理（新実装）
-            manager = SRv6PathManager()
+            manager = SRv6PathManager(enable_visualization=args.visualize)
             
             if args.once:
                 logger.info("双方向1回のみ実行モード")
@@ -829,20 +1071,36 @@ def main():
                     logger.info("✅ 双方向テーブル更新成功")
                 else:
                     logger.error("❌ 双方向テーブル更新失敗")
+                manager.cleanup()
             else:
                 # 双方向リアルタイム監視
                 logger.info(f"双方向リアルタイム監視開始（間隔: {args.interval}秒）")
-                while True:
-                    success = manager.update_bidirectional_tables()
-                    if success:
-                        logger.info("✅ 双方向テーブル更新完了")
-                    else:
-                        logger.error("❌ 双方向テーブル更新失敗")
-                    time.sleep(args.interval)
+                if args.visualize:
+                    logger.info("トポロジ可視化: 有効（画像ファイルとして保存）")
+                
+                try:
+                    while True:
+                        start_time = time.time()
+                        success = manager.update_bidirectional_tables()
+                        if success:
+                            logger.info("✅ 双方向テーブル更新完了")
+                        else:
+                            logger.error("❌ 双方向テーブル更新失敗")
+                        
+                        # 次回更新まで待機
+                        elapsed = time.time() - start_time
+                        sleep_time = max(0, args.interval - elapsed)
+                        logger.info(f"次回更新まで {sleep_time:.1f} 秒待機... (処理時間: {elapsed:.1f}秒)")
+                        logger.info("=" * 80)
+                        time.sleep(sleep_time)
+                        
+                except KeyboardInterrupt:
+                    logger.info("監視を停止します")
+                    manager.cleanup()
                     
         elif args.mode == "analyze":
             # トラフィック分析モード
-            manager = SRv6PathManager()
+            manager = SRv6PathManager(enable_visualization=args.visualize)
             traffic_data = manager.get_all_traffic_data()
             if traffic_data:
                 optimal_path = manager.calculate_optimal_path(traffic_data)
@@ -851,6 +1109,14 @@ def main():
                     return_path_str = ' → '.join([f'r{node}' for node in optimal_path[::-1]])
                     logger.info(f"往路最適経路: {forward_path_str}")
                     logger.info(f"復路最適経路: {return_path_str}")
+                    
+                    # 可視化
+                    if args.visualize:
+                        manager.update_count = 1
+                        manager.visualize_network()
+                        logger.info("可視化画像を保存しました")
+                    
+                    manager.cleanup()
                 else:
                     logger.error("最適経路計算失敗")
             else:
