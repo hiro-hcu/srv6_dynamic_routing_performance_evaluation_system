@@ -346,7 +346,7 @@ class SRv6PathManager:
             # 往路テーブル更新実行（r1）
             forward_success = self.update_all_tables(forward_table_routes)
             
-            # 復路テーブル更新実行（r6）
+            # 復路テーブル更新実行（r16）
             return_success = self.update_return_tables(return_table_routes)
             
             # 可視化の更新
@@ -357,7 +357,7 @@ class SRv6PathManager:
             if forward_success and return_success:
                 logger.info("✅ 双方向テーブル更新成功")
                 logger.info(f"往路（r1）: {len(forward_table_routes)}テーブル更新完了")
-                logger.info(f"復路（r6）: {len(return_table_routes)}テーブル更新完了")
+                logger.info(f"復路（r16）: {len(return_table_routes)}テーブル更新完了")
                 return True
             else:
                 logger.error(f"❌ 双方向テーブル更新失敗 - 往路: {forward_success}, 復路: {return_success}")
