@@ -555,12 +555,12 @@ class TopologyVisualizer:
             ax=self.ax
         )
         
-        # エッジの重み（利用率とコスト）をラベルとして表示
+        # エッジの重み（利用率）をラベルとして表示
         edge_labels = {}
         for u, v in self.graph.edges():
             weight = self.graph[u][v].get('weight', 0.0)
-            # 利用率とコストを表示
-            edge_labels[(u, v)] = f'U:{weight:.4f}\nC:{weight:.4f}'
+            # 利用率のみを表示
+            edge_labels[(u, v)] = f'U:{weight:.4f}'
         
         nx.draw_networkx_edge_labels(
             self.graph, self.pos,
@@ -572,7 +572,7 @@ class TopologyVisualizer:
         # 選択された経路を色分けして描画
         if paths:
             colors = ['red', 'orange', 'green']  # 高優先度、中優先度、低優先度
-            labels = ['高優先度', '中優先度', '低優先度']
+            labels = ['High Priority', 'Medium Priority', 'Low Priority']
             widths = [4, 3, 2]
             
             for idx, (path_nodes, cost) in enumerate(paths[:3]):
@@ -590,7 +590,7 @@ class TopologyVisualizer:
                     edge_costs.append(edge_cost)
                 
                 # 経路を太い色付き線で描画
-                path_str = " → ".join([f"r{n}" for n in path_nodes])
+                path_str = " -> ".join([f"r{n}" for n in path_nodes])
                 avg_edge_cost = sum(edge_costs) / len(edge_costs) if edge_costs else 0.0
                 nx.draw_networkx_edges(
                     self.graph, self.pos,
@@ -598,13 +598,13 @@ class TopologyVisualizer:
                     edge_color=colors[idx],
                     width=widths[idx],
                     alpha=0.7,
-                    label=f'{labels[idx]}: {path_str}\n総コスト={cost:.4f}, 平均エッジコスト={avg_edge_cost:.4f}',
+                    label=f'{labels[idx]}: {path_str}\nTotal Cost={cost:.4f}, Avg Edge Cost={avg_edge_cost:.4f}',
                     ax=self.ax
                 )
         
         # タイトルと凡例
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        self.ax.set_title(f'SRv6 ネットワークトポロジと経路選択\n(更新回数: {update_count}, 更新時刻: {timestamp})', 
+        self.ax.set_title(f'SRv6 Network Topology and Path Selection\n(Update Count: {update_count}, Time: {timestamp})', 
                          fontsize=14, fontweight='bold')
         if paths:
             self.ax.legend(loc='upper left', fontsize=9)
