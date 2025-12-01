@@ -19,10 +19,10 @@ for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | t
     # HTB (Hierarchical Token Bucket) qdiscを設定
     tc qdisc add dev $iface root handle 1: htb default 10
     
-    # 1Gbpsのクラスを作成
-    tc class add dev $iface parent 1: classid 1:10 htb rate $BANDWIDTH ceil $BANDWIDTH
+    # 1Gbpsのクラスを作成（burst/cburstを大きくしてパケットロスを防止）
+    tc class add dev $iface parent 1: classid 1:10 htb rate $BANDWIDTH ceil $BANDWIDTH burst 15k cburst 15k
     
-    echo "✓ $iface: $BANDWIDTH limit applied"
+    echo "✓ $iface: $BANDWIDTH limit applied (burst 15k)"
 done
 
 echo ""

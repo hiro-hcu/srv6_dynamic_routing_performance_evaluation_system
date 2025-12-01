@@ -40,22 +40,26 @@ class SRv6NftablesSetup:
             'chain_config': 'type filter hook prerouting priority mangle;'
         }
         
-        # flow label → mark マッピング（memo.txtの内容を基に）
+        # flow label → mark マッピング（デフォルトルート対応）
+        # デフォルトルートとして、4と6以外は全て低優先度（mark 9）に振り分け
         self.flow_label_rules = [
             {
                 'flow_label': '0xfffc4',
                 'mark_value': 4,
-                'description': '高優先度フロー → mark 4 → rt_table1'
+                'description': '高優先度フロー → mark 4 → rt_table1',
+                'priority': 1  # 高優先度ルール
             },
             {
                 'flow_label': '0xfffc6', 
                 'mark_value': 6,
-                'description': '中優先度フロー → mark 6 → rt_table2'
+                'description': '中優先度フロー → mark 6 → rt_table2',
+                'priority': 2  # 中優先度ルール
             },
             {
-                'flow_label': '0xfffc9',
+                'flow_label': None,
                 'mark_value': 9,
-                'description': '低優先度フロー → mark 9 → rt_table3'
+                'description': 'デフォルトフロー（4,6以外） → mark 9 → rt_table3',
+                'priority': 3  # 低優先度ルール（デフォルト）
             }
         ]
     
@@ -196,22 +200,34 @@ class SRv6NftablesSetup:
         return True
     
     def create_flow_label_rules(self, client: paramiko.SSHClient) -> bool:
-        """Phase 2-2: Flow label → mark変換ルールの作成"""
+        """Phase 2-2: Flow label → mark変換ルールの作成（デフォルトルート対応）"""
         self.logger.info("=== Phase 2-2: Flow label → mark変換ルール作成 ===")
         
         success_count = 0
         for rule in self.flow_label_rules:
             # ルール作成コマンド
-            cmd_rule = (f"nft 'add rule {self.nft_config['table_name']} "
-                       f"{self.nft_config['chain_name']} "
-                       f"ip6 flowlabel {rule['flow_label']} "
-                       f"mark set {rule['mark_value']}'")
+            if rule['flow_label'] is not None:
+                # 特定のflow_labelに対するルール（高優先度・中優先度）
+                cmd_rule = (f"nft 'add rule {self.nft_config['table_name']} "
+                           f"{self.nft_config['chain_name']} "
+                           f"ip6 flowlabel {rule['flow_label']} "
+                           f"mark set {rule['mark_value']}'")
+            else:
+                # デフォルトルール（flow_label指定なし、低優先度）
+                # 既にmarkが設定されていない場合のみmark 9を付与
+                cmd_rule = (f"nft 'add rule {self.nft_config['table_name']} "
+                           f"{self.nft_config['chain_name']} "
+                           f"mark 0 "
+                           f"mark set {rule['mark_value']}'")
             
             rc, out, err = self.execute_command(client, cmd_rule)
             
             if rc == 0:
                 self.logger.info(f"✓ ルール作成成功: {rule['description']}")
-                self.logger.info(f"  flow_label {rule['flow_label']} → mark {rule['mark_value']}")
+                if rule['flow_label'] is not None:
+                    self.logger.info(f"  flow_label {rule['flow_label']} → mark {rule['mark_value']}")
+                else:
+                    self.logger.info(f"  デフォルト（flow_label 4,6以外） → mark {rule['mark_value']}")
                 success_count += 1
             elif "already exists" in err.lower() or "exist" in err.lower():
                 self.logger.info(f"ルール既存: {rule['description']}")
@@ -222,7 +238,7 @@ class SRv6NftablesSetup:
         return success_count == len(self.flow_label_rules)
     
     def verify_nftables_setup(self, client: paramiko.SSHClient) -> bool:
-        """Phase 2-3: nftables設定の検証"""
+        """Phase 2-3: nftables設定の検証（デフォルトルート対応）"""
         self.logger.info("=== Phase 2-3: nftables設定検証 ===")
         
         # テーブル存在確認
@@ -243,18 +259,26 @@ class SRv6NftablesSetup:
                 if line.strip():
                     self.logger.info(f"  {line}")
             
-            # 各ルールの存在確認（16進数を10進数に変換して確認）
+            # 各ルールの存在確認
             rule_check = True
             for rule in self.flow_label_rules:
-                # 16進数を10進数に変換
-                flow_label_dec = str(int(rule['flow_label'], 16))
                 mark_hex = f"0x{rule['mark_value']:08x}"
                 
-                if f"flowlabel {flow_label_dec}" in out and f"mark set {mark_hex}" in out:
-                    self.logger.info(f"✓ ルール確認: flow_label {rule['flow_label']} (10進: {flow_label_dec}) → mark {rule['mark_value']}")
+                if rule['flow_label'] is not None:
+                    # 特定flow_labelルールの確認（16進数を10進数に変換して確認）
+                    flow_label_dec = str(int(rule['flow_label'], 16))
+                    if f"flowlabel {flow_label_dec}" in out and f"mark set {mark_hex}" in out:
+                        self.logger.info(f"✓ ルール確認: flow_label {rule['flow_label']} (10進: {flow_label_dec}) → mark {rule['mark_value']}")
+                    else:
+                        self.logger.error(f"✗ ルール未確認: flow_label {rule['flow_label']} (10進: {flow_label_dec}) → mark {rule['mark_value']}")
+                        rule_check = False
                 else:
-                    self.logger.error(f"✗ ルール未確認: flow_label {rule['flow_label']} (10進: {flow_label_dec}) → mark {rule['mark_value']}")
-                    rule_check = False
+                    # デフォルトルールの確認（mark 0の条件付き）
+                    if f"mark 0x00000000" in out and f"mark set {mark_hex}" in out:
+                        self.logger.info(f"✓ デフォルトルール確認: flow_label 4,6以外 → mark {rule['mark_value']}")
+                    else:
+                        self.logger.error(f"✗ デフォルトルール未確認: mark {rule['mark_value']}")
+                        rule_check = False
             
             return rule_check
         else:
