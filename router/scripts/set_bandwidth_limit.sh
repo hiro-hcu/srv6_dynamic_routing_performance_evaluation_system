@@ -20,9 +20,10 @@ for iface in $(ip link show | grep -E '^[0-9]+:' | cut -d: -f2 | cut -d@ -f1 | t
     tc qdisc add dev $iface root handle 1: htb default 10
     
     # 1Gbpsのクラスを作成（burst/cburstを大きくしてパケットロスを防止）
-    tc class add dev $iface parent 1: classid 1:10 htb rate $BANDWIDTH ceil $BANDWIDTH burst 15k cburst 15k
+    # burst 256k: 約170パケット分のバーストを許容（1Gbpsで約2msのバースト許容時間）
+    tc class add dev $iface parent 1: classid 1:10 htb rate $BANDWIDTH ceil $BANDWIDTH burst 256k cburst 256k
     
-    echo "✓ $iface: $BANDWIDTH limit applied (burst 15k)"
+    echo "✓ $iface: $BANDWIDTH limit applied (burst 256k)"
 done
 
 echo ""
